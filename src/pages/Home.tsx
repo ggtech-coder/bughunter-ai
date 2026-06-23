@@ -2,6 +2,7 @@ import { useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAuthStore } from '@/store/authStore'
 import { useAnalysisStore } from '@/store/analysisStore'
+import URLInput from '@/components/Scanner/URLInput'
 
 export default function Home() {
   const navigate = useNavigate()
@@ -50,6 +51,11 @@ export default function Home() {
           <p className="text-orange-600 text-sm">Riscos Altos</p>
           <p className="text-3xl font-bold mt-2">{stats.highRisks}</p>
         </div>
+      </div>
+
+      <div className="bg-white dark:bg-slate-800 rounded-lg shadow p-6">
+        <h2 className="text-xl font-bold mb-4">Nova Análise</h2>
+        <URLInput onSuccess={() => getTargets(user?.uid || '')} />
       </div>
 
       <div className="bg-white dark:bg-slate-800 rounded-lg shadow p-6">
