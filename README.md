@@ -131,6 +131,7 @@ O projeto está configurado com `base: '/bughunter-ai/'` para deploy em GitHub P
 - [OpenAI API Docs](https://platform.openai.com/docs)
 - [React Router v6](https://reactrouter.com)
 - [Tailwind CSS](https://tailwindcss.com)
+
 - [Zustand](https://github.com/pmndrs/zustand)
 
 ## Licença
