@@ -3,10 +3,42 @@ import { AnalysisResult, Endpoint, Technology, JSAsset, Risk } from '@/types'
 
 const API_TIMEOUT = 30000
 
+// Proxy CORS público gratuito - necessário porque o navegador bloqueia
+// requisições diretas a domínios de terceiros (CORS). Tem limitações:
+// pode ficar instável/lento sob carga, e não expõe headers HTTP originais
+// completos (apenas status code e content-type).
+const CORS_PROXY = 'https://api.allorigins.win/get?url='
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+interface ProxyResponse {
+  content: string
+  statusCode: number
+  contentType: string
+}
+
+async function proxyFetch(targetUrl: string): Promise<ProxyResponse | null> {
+  try {
+    const response = await axios.get(`${CORS_PROXY}${encodeURIComponent(targetUrl)}`, {
+      timeout: API_TIMEOUT,
+    })
+    const data = response.data
+    return {
+      content: data?.contents || '',
+      statusCode: data?.status?.http_code ?? 0,
+      contentType: data?.status?.content_type ?? '',
+    }
+  } catch {
+    return null
+  }
+}
+
 export async function analyzeURL(url: string): Promise<AnalysisResult> {
   try {
     const result: AnalysisResult = {
-      domains: [],
+      domains: [new URL(url).hostname],
       subdomains: [],
       technologies: [],
       headers: {},
@@ -25,24 +57,20 @@ export async function analyzeURL(url: string): Promise<AnalysisResult> {
       aiPriority: '',
     }
 
-    // Fetch headers
-    result.headers = await fetchHeaders(url)
-    
-    // Detect technologies
-    result.technologies = await detectTechnologies(url)
-    
-    // Get SSL info
+    // Busca a página principal uma única vez via proxy (reaproveitada
+    // para detecção de tecnologias e descoberta de assets JS)
+    const mainPage = await proxyFetch(url)
+
+    if (mainPage) {
+      result.headers = mainPage.contentType ? { 'Content-Type': mainPage.contentType } : {}
+      result.technologies = detectTechnologies(mainPage.content)
+      result.jsAssets = await findJSAssets(mainPage.content, url)
+    }
+
     result.ssl = await getSSLInfo(url)
-    
-    // Enumerate endpoints
     result.endpoints = await enumerateEndpoints(url)
-    
-    // Find JS assets
-    result.jsAssets = await findJSAssets(url)
-    
-    // Identify risks
-    result.risks = await identifyRisks(result)
-    
+    result.risks = identifyRisks(result)
+
     return result
   } catch (error) {
     console.error('Analysis error:', error)
@@ -50,79 +78,61 @@ export async function analyzeURL(url: string): Promise<AnalysisResult> {
   }
 }
 
-async function fetchHeaders(url: string): Promise<Record<string, string>> {
-  try {
-    const response = await axios.head(url, { timeout: API_TIMEOUT })
-    return response.headers as Record<string, string>
-  } catch {
-    return {}
-  }
-}
-
-async function detectTechnologies(url: string): Promise<Technology[]> {
+function detectTechnologies(html: string): Technology[] {
   const techs: Technology[] = []
-  
-  try {
-    const response = await axios.get(url, { timeout: API_TIMEOUT })
-    const html = response.data
-    
-    const signatures: Record<string, { version?: string; category: string }> = {
-      'WordPress': { version: 'wp-content', category: 'CMS' },
-      'React': { version: 'react', category: 'Framework' },
-      'Vue': { version: 'vue', category: 'Framework' },
-      'Angular': { version: 'angular', category: 'Framework' },
-      'Bootstrap': { version: 'bootstrap', category: 'CSS Framework' },
-      'Stripe': { version: 'stripe', category: 'Payment' },
-      'Google Analytics': { version: 'google-analytics', category: 'Analytics' },
-      'jQuery': { version: 'jquery', category: 'Library' },
-      'Nginx': { version: 'nginx', category: 'Server' },
-      'Apache': { version: 'apache', category: 'Server' },
-    }
-    
-    for (const [tech, info] of Object.entries(signatures)) {
-      if (html.toLowerCase().includes(info.version.toLowerCase())) {
-        techs.push({
-          name: tech,
-          category: info.category,
-          riskLevel: 'low',
-        })
-      }
-    }
-  } catch {
-    // Silent fail
+  const lowerHtml = html.toLowerCase()
+
+  const signatures: Record<string, { signature: string; category: string }> = {
+    'WordPress': { signature: 'wp-content', category: 'CMS' },
+    'React': { signature: 'react', category: 'Framework' },
+    'Vue': { signature: 'vue', category: 'Framework' },
+    'Angular': { signature: 'ng-version', category: 'Framework' },
+    'Bootstrap': { signature: 'bootstrap', category: 'CSS Framework' },
+    'Stripe': { signature: 'stripe', category: 'Payment' },
+    'Google Analytics': { signature: 'google-analytics', category: 'Analytics' },
+    'jQuery': { signature: 'jquery', category: 'Library' },
   }
-  
+
+  for (const [tech, info] of Object.entries(signatures)) {
+    if (lowerHtml.includes(info.signature.toLowerCase())) {
+      techs.push({ name: tech, category: info.category, riskLevel: 'low' })
+    }
+  }
+
   return techs
 }
 
-async function getSSLInfo(url: string): Promise<any> {
+async function getSSLInfo(url: string): Promise<AnalysisResult['ssl']> {
   try {
-    const urlObj = new URL(url)
-    const hostname = urlObj.hostname
-    
-    const response = await axios.get(`https://api.ssllabs.com/api/v3/analyze?host=${hostname}&publish=off&all=done`)
-    const cert = response.data.certs?.[0]
-    
-    if (cert) {
-      const validTo = new Date(cert.notAfter)
-      const now = new Date()
-      const daysUntil = Math.floor((validTo.getTime() - now.getTime()) / (1000 * 60 * 60 * 24))
-      
-      return {
-        issuer: cert.issuerLabel,
-        validFrom: new Date(cert.notBefore).toLocaleDateString('pt-BR'),
-        validTo: validTo.toLocaleDateString('pt-BR'),
-        fingerprint: cert.sha1Hash,
-        isValid: daysUntil > 0,
-        daysUntilExpiry: daysUntil,
+    const hostname = new URL(url).hostname
+    const analyzeUrl = `https://api.ssllabs.com/api/v3/analyze?host=${hostname}&publish=off&all=done&fromCache=on&maxAge=24`
+    const proxied = await proxyFetch(analyzeUrl)
+
+    if (proxied?.content) {
+      const data = JSON.parse(proxied.content)
+      const cert = data.certs?.[0]
+
+      if (cert) {
+        const validTo = new Date(cert.notAfter)
+        const now = new Date()
+        const daysUntil = Math.floor((validTo.getTime() - now.getTime()) / (1000 * 60 * 60 * 24))
+
+        return {
+          issuer: cert.issuerLabel || 'Desconhecido',
+          validFrom: new Date(cert.notBefore).toLocaleDateString('pt-BR'),
+          validTo: validTo.toLocaleDateString('pt-BR'),
+          fingerprint: cert.sha1Hash || 'N/A',
+          isValid: daysUntil > 0,
+          daysUntilExpiry: daysUntil,
+        }
       }
     }
   } catch {
-    // Fallback
+    // SSL Labs pode ainda estar processando a análise (assíncrona) ou indisponível
   }
-  
+
   return {
-    issuer: 'Unknown',
+    issuer: 'Não disponível',
     validFrom: 'N/A',
     validTo: 'N/A',
     fingerprint: 'N/A',
@@ -134,68 +144,56 @@ async function getSSLInfo(url: string): Promise<any> {
 async function enumerateEndpoints(url: string): Promise<Endpoint[]> {
   const endpoints: Endpoint[] = []
   const commonPaths = [
-    '/api', '/api/v1', '/api/v2', '/admin', '/login', '/register',
-    '/wp-admin', '/wp-login.php', '/.git', '/.env', '/config.php',
-    '/robots.txt', '/sitemap.xml', '/.well-known',
+    '/api', '/admin', '/login', '/.git', '/.env',
+    '/robots.txt', '/sitemap.xml', '/wp-admin',
   ]
-  
+
   const baseURL = new URL(url).origin
-  
+
   for (const path of commonPaths) {
-    try {
-      const response = await axios.head(`${baseURL}${path}`, { timeout: 5000 })
+    const proxied = await proxyFetch(`${baseURL}${path}`)
+    if (proxied) {
       endpoints.push({
         path,
-        method: 'HEAD',
-        statusCode: response.status,
-        isPublic: response.status < 400,
+        method: 'GET',
+        statusCode: proxied.statusCode,
+        isPublic: proxied.statusCode > 0 && proxied.statusCode < 400,
       })
-    } catch (error: any) {
-      if (error.response) {
-        endpoints.push({
-          path,
-          method: 'HEAD',
-          statusCode: error.response.status,
-          isPublic: error.response.status < 400,
-        })
-      }
     }
+    await sleep(400) // evita sobrecarregar o proxy gratuito
   }
-  
+
   return endpoints
 }
 
-async function findJSAssets(url: string): Promise<JSAsset[]> {
+async function findJSAssets(html: string, baseUrl: string): Promise<JSAsset[]> {
   const assets: JSAsset[] = []
-  
-  try {
-    const response = await axios.get(url, { timeout: API_TIMEOUT })
-    const html = response.data
-    const jsRegex = /<script[^>]*src=["']([^"']+)["'][^>]*>/gi
-    
-    let match
-    while ((match = jsRegex.exec(html)) !== null) {
-      const src = match[1]
-      const absoluteURL = new URL(src, url).href
-      
-      try {
-        const jsResponse = await axios.get(absoluteURL, { timeout: 5000 })
-        const hash = Buffer.from(jsResponse.data).toString('hex').slice(0, 16)
-        
-        assets.push({
-          url: absoluteURL,
-          size: jsResponse.data.length,
-          hash,
-          detectedSecrets: detectSecrets(jsResponse.data),
-        })
-      } catch {
-        // Continue
-      }
+  const jsRegex = /<script[^>]*src=["']([^"']+)["'][^>]*>/gi
+  const scriptUrls: string[] = []
+
+  let match
+  while ((match = jsRegex.exec(html)) !== null) {
+    try {
+      scriptUrls.push(new URL(match[1], baseUrl).href)
+    } catch {
+      // ignora URLs inválidas
     }
-  } catch {
-    // Silent fail
   }
-  
+
+  // Limita a 8 scripts para não sobrecarregar o proxy gratuito
+  for (const scriptUrl of scriptUrls.slice(0, 8)) {
+    const proxied = await proxyFetch(scriptUrl)
+    if (proxied?.content) {
+      assets.push({
+        url: scriptUrl,
+        size: proxied.content.length,
+        hash: proxied.content.length.toString(16),
+        detectedSecrets: detectSecrets(proxied.content),
+      })
+    }
+    await sleep(400)
+  }
+
   return assets
 }
 
@@ -207,72 +205,71 @@ function detectSecrets(content: string): string[] {
     'GitHub Token': /gh[pousr]_[A-Za-z0-9_]{36,255}/gi,
     'Private Key': /-----BEGIN (RSA |DSA )?PRIVATE KEY-----/gi,
   }
-  
+
   for (const [type, pattern] of Object.entries(patterns)) {
     if (pattern.test(content)) {
       secrets.push(type)
     }
   }
-  
+
   return secrets
 }
 
-async function identifyRisks(result: AnalysisResult): Promise<Risk[]> {
+function identifyRisks(result: AnalysisResult): Risk[] {
   const risks: Risk[] = []
-  
-  // SSL Risk
-  if (!result.ssl.isValid) {
+
+  const sslChecked = result.ssl.issuer !== 'Não disponível' && result.ssl.issuer !== ''
+
+  if (sslChecked && !result.ssl.isValid) {
     risks.push({
       id: `risk_${Date.now()}_1`,
       type: 'SSL_EXPIRED',
       severity: 'critical',
-      title: 'SSL Certificate Expired',
-      description: 'The SSL certificate for this domain has expired or is invalid',
-      remediation: 'Renew the SSL certificate immediately',
+      title: 'Certificado SSL expirado ou inválido',
+      description: 'O certificado SSL deste domínio expirou ou é inválido',
+      remediation: 'Renove o certificado SSL imediatamente',
       cveList: [],
     })
-  } else if (result.ssl.daysUntilExpiry < 30) {
+  } else if (sslChecked && result.ssl.isValid && result.ssl.daysUntilExpiry < 30) {
     risks.push({
       id: `risk_${Date.now()}_2`,
       type: 'SSL_EXPIRING',
       severity: 'high',
-      title: 'SSL Certificate Expiring Soon',
-      description: `The SSL certificate expires in ${result.ssl.daysUntilExpiry} days`,
-      remediation: 'Renew the SSL certificate before expiration',
+      title: 'Certificado SSL expirando em breve',
+      description: `O certificado expira em ${result.ssl.daysUntilExpiry} dias`,
+      remediation: 'Renove o certificado SSL antes da expiração',
       cveList: [],
     })
   }
-  
-  // Missing Security Headers
-  const requiredHeaders = ['X-Content-Type-Options', 'X-Frame-Options', 'Strict-Transport-Security']
-  const missingHeaders = requiredHeaders.filter(h => !result.headers[h])
-  
-  if (missingHeaders.length > 0) {
-    risks.push({
-      id: `risk_${Date.now()}_3`,
-      type: 'MISSING_SECURITY_HEADERS',
-      severity: 'high',
-      title: 'Missing Security Headers',
-      description: `Missing headers: ${missingHeaders.join(', ')}`,
-      remediation: 'Configure security headers in your web server',
-      cveList: [],
-    })
+
+  const sensitivePaths = ['/.git', '/.env', '/wp-admin', '/admin']
+  for (const endpoint of result.endpoints) {
+    if (endpoint.isPublic && sensitivePaths.includes(endpoint.path)) {
+      risks.push({
+        id: `risk_${Date.now()}_${Math.random()}`,
+        type: 'SENSITIVE_ENDPOINT_EXPOSED',
+        severity: 'critical',
+        title: `Endpoint sensível exposto: ${endpoint.path}`,
+        description: `O caminho ${endpoint.path} está publicamente acessível (status ${endpoint.statusCode})`,
+        remediation: 'Restrinja o acesso a este endpoint via autenticação ou firewall',
+        cveList: [],
+      })
+    }
   }
-  
-  // Exposed Secrets in JS
+
   for (const asset of result.jsAssets) {
     if (asset.detectedSecrets.length > 0) {
       risks.push({
         id: `risk_${Date.now()}_${Math.random()}`,
         type: 'EXPOSED_SECRETS',
         severity: 'critical',
-        title: 'Exposed Secrets in JavaScript',
-        description: `Detected potential secrets in ${asset.url}: ${asset.detectedSecrets.join(', ')}`,
-        remediation: 'Remove all secrets from client-side code, use environment variables',
+        title: 'Possíveis segredos expostos em JavaScript',
+        description: `Padrões detectados em ${asset.url}: ${asset.detectedSecrets.join(', ')}`,
+        remediation: 'Remova segredos do código client-side; use variáveis de ambiente apenas no backend',
         cveList: [],
       })
     }
   }
-  
+
   return risks
 }
